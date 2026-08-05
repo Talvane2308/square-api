@@ -1,4 +1,4 @@
-```markdown
+
 # Square Daily Sales Reports Automation
 
 A Python automation toolkit that fetches raw sales and payment data from Square's APIs and generates CSV reports matching Square's official "Sales Summary Displayed by Location" format.
@@ -121,7 +121,3 @@ Each CSV follows Square's format, including columns for Gross Sales, Net Sales, 
 * **Order Inclusion Rules**: Orders are included if they have tenders (normal payments) or refunds, filtered by `created_at`.
 * **Time Zone**: Calculations use the `America/Los_Angeles` timezone by default. Modify `TIMEZONE` in `square-api.py` if needed.
 * **Security**: Never commit the `auth/` folder or real tokens to version control. The `.gitignore` file is pre-configured to protect them.
-
-```
-
-```
