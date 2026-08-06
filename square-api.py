@@ -15,8 +15,15 @@ What this script does:
 5. Includes orders that have either tenders (normal payment) or refunds
    (return/cancellation orders -- these don't have their own tenders, only
    a refunds[] field, so they need to be accepted too)
-6. Fetches the real fee for each payment via the Payments API, in parallel
-   (WORKERS_PER_ACCOUNT workers)
+6. Fetches the real fee for all payments via the ListPayments API, in bulk
+   per location (drastically fewer requests than one GetPayment call per
+   payment_id). ListPayments doesn't support a status filter server-side,
+   so only payments with status == COMPLETED are kept when building the
+   fee cache -- matching the same COMPLETED-only guarantee the old
+   GetPayment-per-id approach had implicitly (via orders/search already
+   filtering to COMPLETED orders). Locations are queried in parallel
+   (WORKERS_PER_ACCOUNT workers), since ListPayments only accepts one
+   location_id per call (unlike orders/search, which accepts up to 10).
 7. Sums totals per location (Gross Sales, Net Sales, Tax, Tip, Fees, Refunds, etc)
 8. Generates a CSV in the exact same format as Square's native
    "Sales Summary Displayed by Location" report, with stores sorted
@@ -32,6 +39,7 @@ Output location: reports/MM-DD/ (subfolder per report date, relative to this scr
 """
 
 import json
+import random
 import time
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -47,9 +55,20 @@ TIMEZONE = ZoneInfo("America/Los_Angeles")
 SQUARE_API_BASE = "https://connect.squareup.com/v2"
 SQUARE_VERSION = "2026-05-20"
 
-BATCH_PAUSE_SECONDS = 15
-BATCH_SIZE = 6
+BATCH_PAUSE_SECONDS = 10
+BATCH_SIZE = 8
 WORKERS_PER_ACCOUNT = 8
+
+# Retry settings for transient failures (429 rate limit, network errors).
+# Square doesn't publish a fixed requests/sec limit -- their own docs say
+# it can vary per endpoint and recommend exponential backoff with a
+# randomized delay (jitter), so multiple parallel requests that get rate
+# limited at the same moment don't all retry at the exact same instant
+# and collide again. Non-retryable errors (401, 404, etc) fail immediately
+# since waiting and trying again wouldn't fix a bad token or missing
+# resource.
+MAX_RETRIES = 3
+RETRY_BASE_DELAY_SECONDS = 2
 
 COLUMNS = [
     "Gross Sales", "Items", "Service Charges", "Refunds",
@@ -88,6 +107,46 @@ def format_api_date(dt):
     return dt.strftime("%Y-%m-%dT%H:%M:%S+00:00")
 
 
+def request_with_retry(method, url, **kwargs):
+    """Wraps requests.get/requests.post with retry logic for transient
+    failures. Retries on 429 (rate limited) and on network-level errors
+    (timeout, connection reset, etc) -- these are the cases where trying
+    again has a real chance of succeeding. Does NOT retry on other status
+    codes (401, 404, etc), since those indicate a real problem (bad token,
+    wrong endpoint) that waiting won't fix -- the response is returned
+    as-is so the caller's existing status-code check handles it.
+
+    Uses exponential backoff (2s, 4s, 8s) with a randomized jitter added
+    on top, so that when several accounts get rate limited around the
+    same moment (likely, since accounts run in parallel batches), their
+    retries don't all land on the API at the exact same instant and
+    trigger the same 429 again."""
+    last_exception = None
+
+    for attempt in range(MAX_RETRIES + 1):
+        try:
+            response = requests.request(method, url, **kwargs)
+        except requests.exceptions.RequestException as e:
+            last_exception = e
+            response = None
+
+        is_last_attempt = attempt == MAX_RETRIES
+
+        if response is not None and response.status_code != 429:
+            # Success or a non-retryable error -- return immediately either way.
+            return response
+
+        if is_last_attempt:
+            if response is not None:
+                return response  # let the caller's status check report the final 429
+            raise last_exception  # network error persisted through every retry
+
+        delay = (RETRY_BASE_DELAY_SECONDS ** (attempt + 1)) + random.uniform(0, 1)
+        time.sleep(delay)
+
+    return response  # unreachable, satisfies linters
+
+
 def fetch_active_locations(access_token):
     """Automatically discovers all ACTIVE locations linked to the account.
     Returns a list of (location_id, name), already in the alphabetical
@@ -98,7 +157,7 @@ def fetch_active_locations(access_token):
         "Square-Version": SQUARE_VERSION,
         "Authorization": f"Bearer {access_token}",
     }
-    response = requests.get(f"{SQUARE_API_BASE}/locations", headers=headers, timeout=30)
+    response = request_with_retry("GET", f"{SQUARE_API_BASE}/locations", headers=headers, timeout=30)
 
     if response.status_code != 200:
         raise RuntimeError(
@@ -147,7 +206,7 @@ def fetch_orders_one_batch(access_token, location_ids_batch, start_utc, end_utc)
         if cursor:
             body["cursor"] = cursor
 
-        response = requests.post(url, headers=headers, json=body, timeout=30)
+        response = request_with_retry("POST", url, headers=headers, json=body, timeout=30)
 
         if response.status_code != 200:
             raise RuntimeError(
@@ -185,67 +244,107 @@ def cents_to_dollars(cents):
     return (cents or 0) / 100.0
 
 
-def fetch_payment_fee(access_token, payment_id):
-    """Fetches the real fee for a payment via the Payments API (not
-    available in the Orders API). The returned value is always positive
-    (represents the amount charged) -- callers should subtract it, not add."""
+def fetch_payments_for_one_location(access_token, loc_id, start_utc, end_utc):
+    """Fetches every payment for a single location within the window,
+    paginating as needed, and returns a dict {payment_id: fee_cents} --
+    but ONLY for payments whose status is COMPLETED.
+
+    ListPayments has no server-side status filter (confirmed against
+    Square's own API reference and developer forum -- there is no status
+    query parameter), and it returns payments of every status, including
+    FAILED and CANCELED (the v1 endpoint didn't; v2 does). The old
+    GetPayment-per-id approach never had this problem, because it only
+    ever looked up payment_ids that came from orders already filtered to
+    state_filter: COMPLETED by orders/search. This filter recreates that
+    same guarantee explicitly, so the fee cache can never contain a
+    payment tied to a CANCELED/FAILED/APPROVED/PENDING attempt -- rather
+    than relying on the caller to happen to never look those IDs up.
+
+    ListPayments only accepts one location_id per call (unlike
+    orders/search, which accepts up to 10), so this is called once per
+    location -- the parallelism across locations happens in
+    fetch_payments_for_locations."""
     headers = {
         "Square-Version": SQUARE_VERSION,
         "Authorization": f"Bearer {access_token}",
     }
-    response = requests.get(
-        f"{SQUARE_API_BASE}/payments/{payment_id}", headers=headers, timeout=30
-    )
 
-    total_fee = 0
-    if response.status_code == 200:
-        payment = response.json().get("payment", {})
-        for fee in payment.get("processing_fee", []):
-            total_fee += abs(fee.get("amount_money", {}).get("amount", 0))
+    fees = {}
+    cursor = None
 
-    return total_fee
+    while True:
+        params = {
+            "location_id": loc_id,
+            "begin_time": format_api_date(start_utc),
+            "end_time": format_api_date(end_utc),
+            "limit": 100,
+        }
+        if cursor:
+            params["cursor"] = cursor
+
+        response = request_with_retry(
+            "GET", f"{SQUARE_API_BASE}/payments", headers=headers, params=params, timeout=30
+        )
+
+        if response.status_code != 200:
+            raise RuntimeError(
+                f"Square API error fetching payments (status {response.status_code}): {response.text}"
+            )
+
+        data = response.json()
+        for payment in data.get("payments", []):
+            if payment.get("status") != "COMPLETED":
+                continue  # skip FAILED/CANCELED/APPROVED/PENDING -- see docstring
+
+            pid = payment.get("id")
+            if not pid:
+                continue
+
+            total_fee = 0
+            for fee in payment.get("processing_fee", []):
+                total_fee += abs(fee.get("amount_money", {}).get("amount", 0))
+
+            fees[pid] = total_fee
+
+        cursor = data.get("cursor")
+        if not cursor:
+            break
+
+    return fees
 
 
-def fetch_fees_in_parallel(access_token, payment_ids):
-    """Fetches fees for several payment_ids at once, using a worker pool --
-    this is what actually speeds up processing for accounts with many
-    orders (previously it was one sequential network call per payment).
-    Returns a dict {payment_id: fee_cents}."""
-    result = {}
-    unique_ids = list(set(payment_ids))
+def fetch_payments_for_locations(access_token, location_ids, start_utc, end_utc):
+    """Fetches fees for all COMPLETED payments across all of an account's
+    locations, in parallel (WORKERS_PER_ACCOUNT workers) -- since
+    ListPayments only accepts one location per call, this is what keeps a
+    many-location account from paying a sequential cost per location.
+    Returns a merged dict {payment_id: fee_cents} across every location."""
+    fee_cache = {}
 
-    if not unique_ids:
-        return result
+    if not location_ids:
+        return fee_cache
 
     with ThreadPoolExecutor(max_workers=WORKERS_PER_ACCOUNT) as executor:
         futures = {
-            executor.submit(fetch_payment_fee, access_token, pid): pid
-            for pid in unique_ids
+            executor.submit(fetch_payments_for_one_location, access_token, loc_id, start_utc, end_utc): loc_id
+            for loc_id in location_ids
         }
         for future in as_completed(futures):
-            pid = futures[future]
-            result[pid] = future.result()
+            fee_cache.update(future.result())
 
-    return result
+    return fee_cache
 
 
-def sum_orders_by_location(orders, access_token):
+def sum_orders_by_location(orders, fee_cache):
     """Groups and sums the financial totals of each order, by location_id.
     An order is included if it has tenders (normal payment) OR refunds
     (return/cancellation order -- these don't have their own tenders, only
-    a refunds[] field, so they need to be accepted too)."""
+    a refunds[] field, so they need to be accepted too). fee_cache is a
+    pre-built {payment_id: fee_cents} dict (see fetch_payments_for_locations),
+    already restricted to COMPLETED payments."""
     totals = {}
 
     valid_orders = [o for o in orders if o.get("tenders") or o.get("refunds")]
-
-    all_payment_ids = []
-    for order in valid_orders:
-        for tender in order.get("tenders", []):
-            payment_id = tender.get("payment_id") or tender.get("id")
-            if payment_id:
-                all_payment_ids.append(payment_id)
-
-    fee_cache = fetch_fees_in_parallel(access_token, all_payment_ids)
 
     for order in valid_orders:
         loc_id = order.get("location_id")
@@ -274,13 +373,23 @@ def sum_orders_by_location(orders, access_token):
         total_discount_money = order.get("total_discount_money", {}).get("amount", 0)
         total_service_charge_money = order.get("total_service_charge_money", {}).get("amount", 0)
 
-        gross = sum(
-            item.get("gross_sales_money", {}).get("amount", 0)
-            for item in order.get("line_items", [])
-        )
+        # Gift card activation/reload line items don't count as regular
+        # Gross Sales -- Square reports them in a separate "Gift Card
+        # Sales" column instead. Only line items with item_type == "ITEM"
+        # (or missing item_type, which defaults to a regular item) count
+        # toward gross_sales/items.
+        gross = 0
+        gift_card_sales = 0
+        for item in order.get("line_items", []):
+            amount = item.get("gross_sales_money", {}).get("amount", 0)
+            if item.get("item_type") == "GIFT_CARD":
+                gift_card_sales += amount
+            else:
+                gross += amount
 
         t["gross_sales"] += gross
         t["items"] += gross
+        t["gift_card_sales"] += gift_card_sales
         t["service_charges"] += total_service_charge_money
         t["discounts"] += total_discount_money
         t["tax"] += total_tax_money
@@ -397,13 +506,14 @@ def process_account(account_name, account_data, manual_date):
         location_ids = [loc_id for loc_id, _name in sorted_locations]
 
         orders = fetch_orders(access_token, location_ids, start_utc, end_utc)
-        totals = sum_orders_by_location(orders, access_token)
+        fee_cache = fetch_payments_for_locations(access_token, location_ids, start_utc, end_utc)
+        totals = sum_orders_by_location(orders, fee_cache)
 
         path = generate_csv(account_name, totals, sorted_locations, day, day_start_hour, REPORTS_FOLDER)
-        return f"[OK] {account_name}: {path} ({len(orders)} orders, {len(sorted_locations)} active locations)"
+        return True, f"[OK] {account_name}: {path} ({len(orders)} orders, {len(sorted_locations)} active locations)"
 
     except Exception as e:
-        return f"[ERROR] {account_name}: {e}"
+        return False, f"[ERROR] {account_name}: {e}"
 
 
 def main():
@@ -436,6 +546,11 @@ def main():
         for i in range(0, len(account_names), BATCH_SIZE)
     ]
 
+    # Tracks which accounts failed (name -> error message), so we can
+    # print a clear summary at the end regardless of how many batches
+    # ran or in what order they finished.
+    failed_accounts = {}
+
     for i, batch in enumerate(batches):
         print(f"--- Batch {i+1}/{len(batches)}: {', '.join(batch)} ---")
 
@@ -445,8 +560,11 @@ def main():
                 for name in batch
             }
             for future in as_completed(futures):
-                result = future.result()
+                account_name = futures[future]
+                ok, result = future.result()
                 print(f"  {result}")
+                if not ok:
+                    failed_accounts[account_name] = result
 
         is_last_batch = (i == len(batches) - 1)
         if not is_last_batch:
@@ -454,6 +572,23 @@ def main():
             time.sleep(BATCH_PAUSE_SECONDS)
 
     print("Done.")
+
+    # Final summary -- makes failures impossible to miss even when the
+    # terminal output has scrolled past the batch that had the error.
+    if failed_accounts:
+        print()
+        print(f"=== {len(failed_accounts)} account(s) FAILED to generate a report ===")
+        for account_name, error_message in failed_accounts.items():
+            print(f"  - {error_message}")
+        # Keeps the terminal window open only when something failed (e.g.
+        # when the script is launched by double-clicking a shortcut instead
+        # of from an already open terminal), so the failure summary above
+        # stays visible instead of the window closing immediately. On a
+        # clean run the window is allowed to close right away.
+        input("\nPress Enter to close...")
+    else:
+        print()
+        print("All accounts processed successfully.")
 
 
 if __name__ == "__main__":
