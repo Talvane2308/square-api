@@ -1,0 +1,12 @@
+# Credentials and auth tokens
+auth/
+
+# Local generated reports
+reports/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Virtual environment
+venv/
